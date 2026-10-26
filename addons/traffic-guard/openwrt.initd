@@ -1,0 +1,24 @@
+#!/bin/sh /etc/rc.common
+# traffic-guard 的 OpenWrt procd 服务脚本。
+# 安装：由 install-addon.sh 放到 /etc/init.d/openbox-traffic-guard 并 enable。
+# 它只拉起 /opt/openbox-traffic-guard/traffic-guard run，与 Open-Box 本体服务相互独立。
+
+START=99
+STOP=10
+USE_PROCD=1
+
+TG_HOME=/opt/openbox-traffic-guard
+
+start_service() {
+  procd_open_instance
+  procd_set_param command "$TG_HOME/traffic-guard" run
+  procd_set_param respawn 3600 5 5
+  procd_set_param stdout 0
+  procd_set_param stderr 0
+  procd_close_instance
+}
+
+stop_service() {
+  # procd 会结束主进程；临时探测内核是守护进程的子进程，会随守护进程的 trap 一起清理。
+  :
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=traffic-guard - Open-Box node traffic-exhaustion auto switch daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/openbox-traffic-guard/traffic-guard run
+Restart=on-failure
+RestartSec=10
+Environment=TG_VERBOSE=1
+
+[Install]
+WantedBy=multi-user.target

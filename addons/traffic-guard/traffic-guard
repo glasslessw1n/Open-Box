@@ -1,0 +1,436 @@
+#!/bin/sh
+# traffic-guard —— Open-Box 附加组件：节点流量耗尽自动切换守护
+#
+# 解决的问题：订阅节点在“流量耗尽 / 被限速到近乎 0”时，往往仍能连通、延时正常、
+# 测速小请求能过（服务商通常返回一张限流提示页，或连接建立后不给数据），
+# Open-Box 自带的 url-test / 故障转移按连通性与延时判断，会把这种节点当健康节点。
+# 本组件补上“真实流量”这一层检测：
+#
+#   1) 周期性地用内核自带的 sing-box 给被守护组当前选中的节点开一条临时探测通道，
+#      先发小请求（generate_204）确认不是限流页/断流；
+#   2) 连续失败达到阈值后，扫描该组全部候选节点：小请求 + 真实下载（默认 256KB）双重验证，
+#      能跑量、速度达标、不是 HTML 限流页的才算可用，按实测延时最低切换；
+#   3) 切换只通过内核 Clash API 完成（与面板手动点选等效），不改 Open-Box 任何文件、
+#      不重启内核、不断开其它组的连接；
+#   4) 耗尽节点进黑名单（带 TTL，到期自动复测，流量恢复后能切回候选池）；
+#      带切换冷却与失败计数防抖，全部节点都不可用时保持现状并记录日志。
+#
+# 本组件是独立第三方附加程序，与 Open-Box 本体无关：只读 /opt/open-box/etc/config.json，
+# 程序与状态都放在 /opt/openbox-traffic-guard/，Open-Box 升级不会影响它，它也不影响升级。
+
+set -u
+
+TG_VERSION=1.0.0
+GUARD_HOME=${TG_HOME:-/opt/openbox-traffic-guard}
+CONF_FILE=${TG_CONF:-$GUARD_HOME/traffic-guard.conf}
+
+# ---------- 默认配置（可被 traffic-guard.conf 覆盖） ----------
+ENABLE=1
+OB_ROOT=/opt/open-box
+CHECK_INTERVAL=120          # 巡检间隔（秒）
+FAIL_STREAK=2               # 当前节点连续失败几次才触发扫描切换
+SWITCH_COOLDOWN=300         # 同一组两次切换的最小间隔（秒）
+BLACKLIST_TTL=1800          # 判定耗尽的节点在黑名单中停留多久（秒），到期复测
+FULL_SCAN_INTERVAL=21600    # 兜底全量复检间隔（秒，0=关闭）：小请求能过也要定期验真实下载
+PROBE_PORT=17991            # 临时探测通道监听端口（127.0.0.1）
+SMALL_URL=https://www.gstatic.com/generate_204
+SMALL_TIMEOUT=10
+FULL_URL='https://speed.cloudflare.com/__down?bytes=262144'
+FULL_TIMEOUT=20
+MIN_BYTES=200000            # 全量探测至少要下载到的字节数
+MIN_SPEED_BPS=20480         # 全量探测的最低平均速度（字节/秒），低于此视为被限速
+REMOTE_DNS=1.1.1.1          # 探测时经节点解析域名用的 DNS
+LIMIT_MARKERS=              # 逗号分隔的限流页特征词（可选，如“流量已用完,套餐已到期”）
+MANAGED_GROUPS=             # 逗号分隔：只守护这些 selector 组；留空=全部 selector 组
+EXCLUDE_GROUPS=             # 逗号分隔：永不守护的组（优先于 MANAGED_GROUPS）
+LOG_MAX_BYTES=524288
+
+[ -f "$CONF_FILE" ] && . "$CONF_FILE"
+
+# ---------- 路径 ----------
+STATE_DIR=$GUARD_HOME/state
+LIB=$GUARD_HOME/tg-lib.mjs
+CORE_CFG=$OB_ROOT/etc/config.json
+SINGBOX=$OB_ROOT/bin/sing-box
+NODE_BIN=$OB_ROOT/node/bin/node
+LOG_FILE=$STATE_DIR/traffic-guard.log
+BLACKLIST=$STATE_DIR/blacklist.tsv
+STREAKS=$STATE_DIR/streaks.tsv
+LASTSWITCH=$STATE_DIR/last-switch.tsv
+LASTFULL=$STATE_DIR/last-full-scan
+NODES_TSV=$STATE_DIR/nodes.tsv
+PROXIES_JSON=$STATE_DIR/proxies.json
+PROBE_DIR=$STATE_DIR/probe
+PROBE_CFG=$PROBE_DIR/config.json
+PROBE_WD=$PROBE_DIR/wd
+PROBE_BODY=$PROBE_DIR/body.bin
+PROBE_LOG=$PROBE_DIR/core.log
+LOCK_DIR=$STATE_DIR/lock
+
+mkdir -p "$STATE_DIR" "$PROBE_DIR" "$PROBE_WD"
+for f in "$BLACKLIST" "$STREAKS" "$LASTSWITCH"; do [ -f "$f" ] || : > "$f"; done
+
+probe_pid=
+API_CTL=
+API_SECRET=
+
+# ---------- 基础工具 ----------
+now_s() { date +%s; }
+
+log_msg() {
+  line="$(date '+%Y-%m-%d %H:%M:%S') traffic-guard: $*"
+  # 日志过长时截断保留后半段，避免长期运行把闪存写满
+  if [ -f "$LOG_FILE" ]; then
+    sz=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "${sz:-0}" -gt "$LOG_MAX_BYTES" ]; then
+      tail -c $((LOG_MAX_BYTES / 2)) "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+    fi
+  fi
+  printf '%s\n' "$line" >> "$LOG_FILE"
+  command -v logger >/dev/null 2>&1 && logger -t openbox-traffic-guard "$*" 2>/dev/null
+  [ -n "${TG_VERBOSE:-}" ] && printf '%s\n' "$line"
+}
+
+# 用 Open-Box 自带的 Node 跑 tg-lib（musl 设备上需要它自己的 preload 约定，与面板启动方式一致）
+tg() {
+  _pl=
+  [ -f "$OB_ROOT/data/node-preload" ] && _pl=$(cat "$OB_ROOT/data/node-preload" 2>/dev/null)
+  if [ -n "$_pl" ]; then
+    LD_PRELOAD="$_pl" OPENSSL_CONF=/dev/null LD_LIBRARY_PATH="$OB_ROOT/node/lib" "$NODE_BIN" "$LIB" "$@"
+  else
+    OPENSSL_CONF=/dev/null LD_LIBRARY_PATH="$OB_ROOT/node/lib" "$NODE_BIN" "$LIB" "$@"
+  fi
+}
+
+# ---------- 状态表（TSV）读写 ----------
+# 通用：tsv_get <file> <key> -> value（无则空）
+tsv_get() {
+  awk -F '\t' -v k="$2" '$1==k {print $2; exit}' "$1" 2>/dev/null
+}
+# 通用：tsv_set <file> <key> <value...（整行替换）>
+tsv_set() {
+  _f=$1; _k=$2; shift 2
+  _tmp="$_f.tmp.$$"
+  grep -v "^$_k	" "$_f" > "$_tmp" 2>/dev/null || : > "$_tmp"
+  printf '%s\t%s\n' "$_k" "$*" >> "$_tmp"
+  mv "$_tmp" "$_f"
+}
+tsv_del() {
+  _tmp="$1.tmp.$$"
+  grep -v "^$2	" "$1" > "$_tmp" 2>/dev/null || : > "$_tmp"
+  mv "$_tmp" "$1"
+}
+
+fp_of() { awk -F '\t' -v t="$1" '$1==t {print $3; exit}' "$NODES_TSV" 2>/dev/null; }
+
+streak_get() { v=$(tsv_get "$STREAKS" "$1"); echo "${v:-0}"; }
+streak_set() {
+  if [ "$2" -le 0 ]; then tsv_del "$STREAKS" "$1"; else tsv_set "$STREAKS" "$1" "$2"; fi
+}
+
+# 黑名单：fp -> 过期时间戳 + 原因
+bl_add() {
+  [ -n "$1" ] || return 0
+  tsv_set "$BLACKLIST" "$1" "$(( $(now_s) + BLACKLIST_TTL ))" "$2"
+  log_msg "节点标记为不可用（${BLACKLIST_TTL}s 内不再选用）：fp=$1 原因=$2"
+}
+bl_fresh() {  # fp 仍在有效期内返回 0
+  [ -n "$1" ] || return 1
+  exp=$(tsv_get "$BLACKLIST" "$1")
+  [ -n "$exp" ] && [ "$exp" -gt "$(now_s)" ]
+}
+bl_prune() {
+  _now=$(now_s); _tmp="$BLACKLIST.tmp.$$"
+  awk -F '\t' -v n="$_now" '$2=="" || $2 > n' "$BLACKLIST" > "$_tmp" 2>/dev/null || : > "$_tmp"
+  mv "$_tmp" "$BLACKLIST"
+}
+
+# ---------- 临时探测内核 ----------
+port_listening() {
+  _hex=$(printf '%04X' "$1")
+  awk -v p=":$_hex" '$2 ~ p"$" && $4=="0A" {f=1} END {exit(f?0:1)}' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+start_probe_core() {  # $1=节点 tag；成功返回 0；结果写 PROBE_CFG
+  # 先等端口真正空出来：上一个探测内核刚 kill 时端口可能还在释放中，
+  # 若此时误把“正在退出的旧内核”当成新内核的监听，探测会打到错误节点上（实测踩过）。
+  _i=0
+  while port_listening "$PROBE_PORT"; do
+    _i=$((_i + 1)); [ $_i -ge 30 ] && return 1
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+  tg probe-config "$CORE_CFG" "$1" "$PROBE_PORT" "" "$REMOTE_DNS" > "$PROBE_CFG" 2>>"$LOG_FILE" || return 1
+  : > "$PROBE_LOG"
+  "$SINGBOX" run -c "$PROBE_CFG" -D "$PROBE_WD" >> "$PROBE_LOG" 2>&1 &
+  probe_pid=$!
+  _i=0
+  while [ $_i -lt 50 ]; do
+    port_listening "$PROBE_PORT" && return 0
+    kill -0 "$probe_pid" 2>/dev/null || return 1
+    _i=$((_i + 1))
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+  return 1
+}
+
+stop_probe_core() {
+  if [ -n "$probe_pid" ]; then
+    kill "$probe_pid" 2>/dev/null
+    wait "$probe_pid" 2>/dev/null
+    probe_pid=
+  fi
+  # 等端口释放完毕再返回，保证下一次探测不会串到旧内核
+  _i=0
+  while port_listening "$PROBE_PORT"; do
+    _i=$((_i + 1)); [ $_i -ge 30 ] && break
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+}
+
+# 探测专用 curl：先清掉环境里的代理变量再显式 -x 指定探测通道。
+# 否则若环境存在 http_proxy/no_proxy（例如目标是 127.0.0.1 或命中 no_proxy 名单），
+# curl 会绕过探测通道直连目标，把耗尽节点误判成健康——这是绝不能出现的静默失效。
+probe_curl() {
+  no_proxy= NO_PROXY= http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= all_proxy= ALL_PROXY= \
+    curl -sS -x "http://127.0.0.1:$PROBE_PORT" "$@"
+}
+
+# 探测结果全局变量：PROBE_OK(0/1) PROBE_REASON PROBE_RTT_MS
+probe_small() {  # $1=tag；要求探测内核已启动
+  _out=$(probe_curl -o "$PROBE_BODY" --max-time "$SMALL_TIMEOUT" \
+        -w '%{http_code} %{time_starttransfer} %{content_type}' "$SMALL_URL" 2>/dev/null)
+  _rc=$?
+  PROBE_OK=1; PROBE_REASON=; PROBE_RTT_MS=
+  if [ $_rc -ne 0 ]; then PROBE_OK=0; PROBE_REASON="net-$_rc"; return; fi
+  set -- $_out
+  _code=$1; _ttfb=$2; _ctype=${3:-}
+  PROBE_RTT_MS=$(awk -v t="$_ttfb" 'BEGIN {printf "%d", t * 1000}')
+  if [ "$_code" != "204" ]; then
+    PROBE_OK=0
+    case "$_ctype" in
+      *text/html*) PROBE_REASON="blockpage-$_code" ;;
+      *) PROBE_REASON="http-$_code" ;;
+    esac
+    return
+  fi
+  PROBE_OK=1
+}
+
+probe_full() {  # $1=tag；要求探测内核已启动
+  _out=$(probe_curl -o "$PROBE_BODY" --max-time "$FULL_TIMEOUT" \
+        -w '%{http_code} %{size_download} %{speed_download} %{content_type} %{time_starttransfer}' "$FULL_URL" 2>/dev/null)
+  _rc=$?
+  PROBE_OK=1; PROBE_REASON=; PROBE_RTT_MS=
+  if [ $_rc -ne 0 ]; then PROBE_OK=0; PROBE_REASON="net-$_rc"; return; fi
+  set -- $_out
+  _code=$1; _size=${2%.*}; _speed=${3%.*}; _ctype=${4:-}
+  PROBE_RTT_MS=$(awk -v t="${5:-0}" 'BEGIN {printf "%d", t * 1000}')
+  case "$_ctype" in
+    *text/html*) PROBE_OK=0; PROBE_REASON="blockpage-$_code"; return ;;
+  esac
+  if [ "${_size:-0}" -lt "$MIN_BYTES" ]; then PROBE_OK=0; PROBE_REASON="short-${_size}B"; return; fi
+  if [ "${_speed:-0}" -lt "$MIN_SPEED_BPS" ]; then PROBE_OK=0; PROBE_REASON="slow-${_speed}Bps"; return; fi
+  # 可选的限流页特征词（只扫小体积响应体，二进制大文件不扫，避免误伤）
+  if [ -n "$LIMIT_MARKERS" ] && [ "${_size:-0}" -lt 65536 ]; then
+    _oldifs=$IFS; IFS=','
+    for _m in $LIMIT_MARKERS; do
+      IFS=$_oldifs
+      [ -n "$_m" ] && grep -qiF "$_m" "$PROBE_BODY" 2>/dev/null && { PROBE_OK=0; PROBE_REASON="marker"; return; }
+      IFS=','
+    done
+    IFS=$_oldifs
+  fi
+  PROBE_OK=1
+}
+
+# 对单个节点做完整探测（启停探测内核 + 小请求 [+ 全量]）
+# $1=tag $2=with-full(0/1)；结果在 PROBE_OK/PROBE_REASON/PROBE_RTT_MS（取小请求的 RTT 作为延时）
+probe_node() {
+  PROBE_OK=0; PROBE_REASON="core-start"; PROBE_RTT_MS=
+  if ! start_probe_core "$1"; then
+    stop_probe_core
+    return
+  fi
+  probe_small "$1"
+  _small_rtt=$PROBE_RTT_MS
+  if [ "$PROBE_OK" = 1 ] && [ "$2" = 1 ]; then
+    probe_full "$1"
+    [ -n "$_small_rtt" ] && PROBE_RTT_MS=$_small_rtt
+  fi
+  stop_probe_core
+}
+
+# ---------- Clash API ----------
+api_refresh() {
+  _line=$(tg api-info "$CORE_CFG" 2>/dev/null) || return 1
+  API_CTL=$(printf '%s' "$_line" | cut -f1)
+  API_SECRET=$(printf '%s' "$_line" | cut -f2)
+  [ -n "$API_CTL" ]
+}
+
+api_switch() {  # $1=group $2=node
+  tg switch "$API_CTL" "$API_SECRET" "$1" "$2" >/dev/null 2>&1
+}
+
+# ---------- 一轮巡检 ----------
+run_cycle() {
+  [ -f "$CORE_CFG" ] || { log_msg "内核配置 $CORE_CFG 不存在，跳过本轮"; return; }
+  [ -x "$SINGBOX" ] || { log_msg "内核二进制 $SINGBOX 不存在，跳过本轮"; return; }
+  [ -x "$NODE_BIN" ] || { log_msg "未找到 Open-Box 自带 Node（$NODE_BIN），本组件需要它解析配置，跳过本轮"; return; }
+  command -v curl >/dev/null 2>&1 || { log_msg "未找到 curl，跳过本轮"; return; }
+  api_refresh || { log_msg "读取 Clash API 配置失败，跳过本轮"; return; }
+  tg ping "$API_CTL" "$API_SECRET" || { log_msg "内核未运行（Clash API 无响应），跳过本轮"; return; }
+  tg proxies "$API_CTL" "$API_SECRET" "$PROXIES_JSON" 2>>"$LOG_FILE" || { log_msg "拉取 /proxies 失败，跳过本轮"; return; }
+  tg nodes "$CORE_CFG" > "$NODES_TSV" 2>>"$LOG_FILE" || return
+  bl_prune
+
+  # 是否到了兜底全量复检时间
+  _force=0
+  if [ "$FULL_SCAN_INTERVAL" -gt 0 ]; then
+    _last=0; [ -f "$LASTFULL" ] && _last=$(cat "$LASTFULL" 2>/dev/null || echo 0)
+    [ $(( $(now_s) - ${_last:-0} )) -ge "$FULL_SCAN_INTERVAL" ] && _force=1
+  fi
+
+  _plan=$(TG_MANAGED_GROUPS="$MANAGED_GROUPS" TG_EXCLUDE_GROUPS="$EXCLUDE_GROUPS" tg plan "$CORE_CFG" "$PROXIES_JSON" 2>>"$LOG_FILE")
+  [ -n "$_plan" ] || { [ "$_force" = 1 ] && now_s > "$LASTFULL"; return; }
+
+  printf '%s\n' "$_plan" | while IFS='	' read -r g_name g_now g_nowfp g_members; do
+    [ -n "$g_name" ] || continue
+    # 切换冷却
+    _lastsw=$(tsv_get "$LASTSWITCH" "$g_name")
+    if [ -n "$_lastsw" ] && [ $(( $(now_s) - _lastsw )) -lt "$SWITCH_COOLDOWN" ]; then
+      continue
+    fi
+    # 探测当前节点：平时只做小请求；兜底复检时小+全量
+    probe_node "$g_now" "$_force"
+    if [ "$PROBE_OK" = 1 ]; then
+      streak_set "$g_name" 0
+      continue
+    fi
+    _cur_reason=$PROBE_REASON
+    _streak=$(( $(streak_get "$g_name") + 1 ))
+    streak_set "$g_name" "$_streak"
+    log_msg "组「$g_name」当前节点「$g_now」真实流量探测失败（$_cur_reason），连续失败 $_streak/$FAIL_STREAK"
+    if [ "$_streak" -lt "$FAIL_STREAK" ] && [ "$_force" != 1 ]; then
+      continue
+    fi
+    # 当前节点已确认真实流量失败，先拉黑（TTL 到期后自动复测，机场重置流量后能回来）
+    bl_add "$g_nowfp" "$_cur_reason"
+    # ---- 扫描候选：两遍，第一遍跳过黑名单，第二遍（第一遍无可用时）放开黑名单复测 ----
+    _best_tag=; _best_rtt=
+    _pass=1
+    while [ $_pass -le 2 ]; do
+      [ -n "$_best_tag" ] && break
+      _oldifs=$IFS; IFS=','
+      for _cand in $g_members; do
+        IFS=$_oldifs
+        [ "$_cand" = "$g_now" ] && continue
+        _cfp=$(fp_of "$_cand")
+        if [ "$_pass" = 1 ] && bl_fresh "$_cfp"; then continue; fi
+        probe_node "$_cand" 1
+        if [ "$PROBE_OK" != 1 ]; then
+          bl_add "$_cfp" "$PROBE_REASON"
+          log_msg "组「$g_name」候选节点「$_cand」不可用（$PROBE_REASON）"
+          continue
+        fi
+        log_msg "组「$g_name」候选节点「$_cand」可用，延时 ${PROBE_RTT_MS}ms"
+        if [ -z "$_best_tag" ] || [ "${PROBE_RTT_MS:-999999}" -lt "${_best_rtt:-999999}" ]; then
+          _best_tag=$_cand; _best_rtt=$PROBE_RTT_MS
+        fi
+      done
+      IFS=$_oldifs
+      _pass=$((_pass + 1))
+    done
+    if [ -n "$_best_tag" ]; then
+      if api_switch "$g_name" "$_best_tag"; then
+        tsv_set "$LASTSWITCH" "$g_name" "$(now_s)" "$_best_tag"
+        streak_set "$g_name" 0
+        log_msg "组「$g_name」已自动切换：$_cur_reason 的「$g_now」→「$_best_tag」（延时 ${_best_rtt}ms）"
+      else
+        log_msg "组「$g_name」切换到「$_best_tag」失败（Clash API 拒绝），保持现状"
+      fi
+    else
+      bl_add "$g_nowfp" "$_cur_reason"
+      log_msg "组「$g_name」全部候选节点均不可用，保持当前节点「$g_now」"
+    fi
+  done
+  [ "$_force" = 1 ] && now_s > "$LASTFULL"
+  return 0
+}
+
+# ---------- 入口 ----------
+preflight() {
+  if [ "$ENABLE" != 1 ]; then
+    log_msg "ENABLE!=1，traffic-guard 已停用"
+    return 1
+  fi
+  return 0
+}
+
+cmd_run() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    log_msg "已有 traffic-guard 实例在运行（$LOCK_DIR），退出"
+    exit 1
+  fi
+  trap 'stop_probe_core; rm -rf "$LOCK_DIR"; exit 0' INT TERM
+  trap 'stop_probe_core; rm -rf "$LOCK_DIR"' EXIT
+  log_msg "traffic-guard v$TG_VERSION 启动（巡检间隔 ${CHECK_INTERVAL}s，失败阈值 $FAIL_STREAK，冷却 ${SWITCH_COOLDOWN}s）"
+  while :; do
+    run_cycle
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+cmd_status() {
+  echo "== traffic-guard v$TG_VERSION =="
+  echo "配置: $CONF_FILE（ENABLE=$ENABLE 间隔=${CHECK_INTERVAL}s 阈值=$FAIL_STREAK 冷却=${SWITCH_COOLDOWN}s 黑名单=${BLACKLIST_TTL}s）"
+  echo "守护组: ${MANAGED_GROUPS:-（全部 selector 组）} 排除: ${EXCLUDE_GROUPS:-无}"
+  echo "-- 黑名单（未过期） --"
+  bl_prune
+  if [ -s "$BLACKLIST" ]; then
+    while IFS='	' read -r fp exp reason; do
+      tag=$(awk -F '\t' -v f="$fp" '$3==f {print $1; exit}' "$NODES_TSV" 2>/dev/null)
+      echo "  ${tag:-未知节点} fp=$fp 到期=$(date -d "@$exp" '+%H:%M:%S' 2>/dev/null || echo "$exp") 原因=$reason"
+    done < "$BLACKLIST"
+  else
+    echo "  （空）"
+  fi
+  echo "-- 最近切换 --"
+  [ -s "$LASTSWITCH" ] && cat "$LASTSWITCH" || echo "  （无）"
+  echo "-- 最近日志 --"
+  tail -n 20 "$LOG_FILE" 2>/dev/null || echo "  （无日志）"
+}
+
+case "${1:-run}" in
+  run)
+    preflight || exit 0
+    cmd_run
+    ;;
+  once)
+    preflight || exit 0
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then echo "traffic-guard 正在运行中" >&2; exit 1; fi
+    trap 'stop_probe_core; rm -rf "$LOCK_DIR"' EXIT
+    run_cycle
+    ;;
+  probe)
+    [ -n "${2:-}" ] || { echo "用法: traffic-guard probe <节点名> [full]" >&2; exit 2; }
+    _full=0; [ "${3:-}" = full ] && _full=1
+    probe_node "$2" "$_full"
+    if [ "$PROBE_OK" = 1 ]; then
+      echo "节点「$2」可用，延时 ${PROBE_RTT_MS}ms"
+    else
+      echo "节点「$2」不可用：$PROBE_REASON"
+      exit 1
+    fi
+    ;;
+  status)
+    cmd_status
+    ;;
+  version)
+    echo "traffic-guard $TG_VERSION"
+    ;;
+  *)
+    echo "用法: $0 {run|once|probe <节点名> [full]|status|version}" >&2
+    exit 2
+    ;;
+esac

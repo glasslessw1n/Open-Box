@@ -1,0 +1,47 @@
+# traffic-guard 配置（shell 语法 KEY=value，改完重启 traffic-guard 服务生效）
+# 安装后位于 /opt/openbox-traffic-guard/traffic-guard.conf
+
+# 总开关：1=启用，0=停用（守护进程会直接退出）
+ENABLE=1
+
+# ---- 巡检与防抖 ----
+# 巡检间隔（秒）。每轮只对每个组当前选中的节点发一个很小的请求（generate_204），开销可忽略。
+CHECK_INTERVAL=120
+# 当前节点连续探测失败几次才触发“扫描候选并切换”。2 表示最多容忍一次抖动。
+FAIL_STREAK=2
+# 同一组两次自动切换的最小间隔（秒），避免在边缘状态来回跳。
+SWITCH_COOLDOWN=300
+# 被判定耗尽/不可用的节点在黑名单停留的时间（秒）。到期后会重新参与候选扫描，
+# 机场按月/按日重置流量后能自动回来。
+BLACKLIST_TTL=1800
+# 兜底全量复检间隔（秒，0=关闭）：有些节点小请求能过、真实下载却不行，
+# 每隔这么久对每个当前节点强制做一次真实下载验证。
+FULL_SCAN_INTERVAL=21600
+
+# ---- 探测参数 ----
+# 小请求探测地址（期望返回 204 无内容；返回 HTML 限流页/其它状态码都判失败）。
+SMALL_URL=https://www.gstatic.com/generate_204
+SMALL_TIMEOUT=10
+# 真实下载探测地址：默认从 Cloudflare 测速端点拉 256KB。
+FULL_URL=https://speed.cloudflare.com/__down?bytes=262144
+FULL_TIMEOUT=20
+# 判定“能真正跑量”的门槛：至少下载到 MIN_BYTES 字节，且平均速度不低于 MIN_SPEED_BPS（字节/秒）。
+MIN_BYTES=200000
+MIN_SPEED_BPS=20480
+# 探测时经节点解析目标域名所用的 DNS（任意可用公共 DNS 即可）。
+REMOTE_DNS=1.1.1.1
+# 临时探测通道在本机监听的端口（127.0.0.1）。与其它服务冲突时改这里。
+PROBE_PORT=17991
+# 限流页特征词（逗号分隔，可选）：仅当全量探测的响应体小于 64KB 时才扫描，
+# 命中任一词判为限流页。示例：LIMIT_MARKERS=流量已用完,套餐已到期,traffic exceeded
+LIMIT_MARKERS=
+
+# ---- 守护范围 ----
+# 只守护这些 selector 组（逗号分隔，用面板里看到的组名）。留空=守护全部 selector 组。
+MANAGED_GROUPS=
+# 永不守护的组（逗号分隔），优先级高于 MANAGED_GROUPS。
+# 建议把“手动固定用途”的组放进来，例如专门指定给某个分流策略、不能随便换的组。
+EXCLUDE_GROUPS=
+
+# Open-Box 安装根目录（一般不用改）。
+OB_ROOT=/opt/open-box
